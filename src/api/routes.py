@@ -27,6 +27,7 @@ from src.browser.manager import BrowserManager
 from src.chatgpt.client import ChatGPTClient
 from src.claude.client import ClaudeClient
 from src.minimax.client import MiniMaxClient
+from src.config import Config
 from src.log import setup_logging
 
 log = setup_logging("api_routes")
@@ -161,8 +162,13 @@ async def status() -> StatusResponse:
     """Health check — returns login status and current thread."""
     try:
         client = _get_client()
-        logged_in = True if _browser is None else await _browser.is_logged_in()
-        tid = client._extract_thread_id()
+        provider = Config.model_provider(Config.DEFAULT_MODEL)
+        logged_in = (
+            True if not Config.uses_browser(provider)
+            else await _browser.is_logged_in(provider=provider, page=client.page)
+        )
+        get_thread_id = getattr(client, "_extract_thread_id", None)
+        tid = get_thread_id() if callable(get_thread_id) else str()
         return StatusResponse(status="ok", logged_in=logged_in, current_thread=tid)
     except Exception:
         return StatusResponse(status="ok", logged_in=False, current_thread="")

@@ -70,7 +70,7 @@ class ChatMessage(BaseModel):
 
 class ChatCompletionRequest(BaseModel):
     """OpenAI-compatible chat completion request body."""
-    model: str = "catgpt-browser"
+    model: str | None = None
     messages: list[ChatMessage]
     tools: Optional[list[ToolDefinition]] = None
     tool_choice: Optional[Union[str, dict]] = None  # "auto" | "none" | {"type":"function","function":{"name":"..."}}
@@ -205,7 +205,7 @@ class ResponsesFunctionCallOutputInput(BaseModel):
 
 class ResponsesRequest(BaseModel):
     """Request body for POST /v1/responses."""
-    model: str = "catgpt-browser"
+    model: str | None = None
     input: Union[str, List[Any]]  # string or array of messages/items
     instructions: Optional[str] = None  # system prompt
     tools: Optional[List[ResponsesToolDefinition]] = None

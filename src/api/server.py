@@ -31,7 +31,7 @@ from src.claude.client import ClaudeClient
 from src.minimax.client import MiniMaxClient
 from src.config import Config
 from src.api.routes import router, set_client
-from src.api.openai_routes import openai_router, set_openai_client
+from src.api.openai_routes import openai_router, set_openai_clients
 from src.log import setup_logging
 
 log = setup_logging("api_server")
@@ -43,67 +43,63 @@ _client: ChatGPTClient | ClaudeClient | MiniMaxClient | None = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize the active provider and release its resources on shutdown."""
+    """Run every enabled model concurrently with isolated provider tabs."""
     global _browser, _client
+    Config.validate_models()
+    model_ids = Config.available_models()
+    clients: dict[str, ChatGPTClient | ClaudeClient | MiniMaxClient] = {}
+    browser_models = [m for m in model_ids if Config.uses_browser(Config.model_provider(m))]
+    _browser = None
+    _client = None
 
-    Config.validate_provider()
-    target_url = Config.provider_url()
-    provider_name = Config.provider_name()
-    log.info(f"Provider: {provider_name} ({target_url})")
+    try:
+        if browser_models:
+            _browser = BrowserManager()
+            initial_page = await _browser.start()
+            for index, model_id in enumerate(browser_models):
+                provider = Config.model_provider(model_id)
+                target_url = Config.provider_url(provider)
+                page = initial_page if index == 0 else await _browser.new_page()
+                for attempt in range(1, 6):
+                    try:
+                        await page.goto(target_url, wait_until="domcontentloaded", timeout=25000)
+                        break
+                    except Exception as exc:
+                        if attempt == 5:
+                            raise
+                        log.warning("%s navigation retry %d: %s", model_id, attempt, exc)
+                        await asyncio.sleep(5 * attempt)
 
-    if Config.PROVIDER == "minimax":
+                if index == 0:
+                    # Stealth patches are deliberately applied after navigation.
+                    await _browser.apply_stealth_patches()
+                await asyncio.sleep(1)
+                if not await _browser.is_logged_in(provider=provider, page=page):
+                    logged_in = await ensure_logged_in(_browser, provider=provider, page=page)
+                    if not logged_in:
+                        raise RuntimeError(f"Login was not verified for {model_id}")
+                clients[model_id] = (
+                    ClaudeClient(page) if provider == "claude" else ChatGPTClient(page)
+                )
+                log.info("Browser model ready: %s (%s)", model_id, target_url)
+
+        for model_id in model_ids:
+            if Config.model_provider(model_id) == "minimax":
+                clients[model_id] = MiniMaxClient(model=model_id)
+                log.info("API model ready: %s", model_id)
+        if "MiniMax-M2.7" in Config.ENABLED_MODELS and not Config.MINIMAX_API_KEY:
+            log.warning("MiniMax-M2.7 not advertised: set MINIMAX_API_KEY to enable")
+
+        _client = clients[Config.DEFAULT_MODEL]
+        set_client(_client, _browser)
+        set_openai_clients(clients, _browser)
+        log.info("Gateway ready; models: %s", ", ".join(clients))
+        yield
+    finally:
+        if _browser is not None:
+            await _browser.close()
         _browser = None
-        _client = MiniMaxClient()
-    else:
-        log.info("Starting browser for API server...")
-        _browser = BrowserManager()
-        page = await _browser.start()
-
-        # Navigate with retries (DNS can be slow in Docker)
-        max_retries = 5
-        for attempt in range(1, max_retries + 1):
-            try:
-                log.info(f"Navigation attempt {attempt}/{max_retries} to {target_url}")
-                await _browser.navigate(target_url)
-                break
-            except Exception as e:
-                log.warning(f"Navigation attempt {attempt} failed: {e}")
-                if attempt == max_retries:
-                    log.error("All navigation attempts failed")
-                    raise
-                wait_time = attempt * 5  # 5s, 10s, 15s, 20s
-                log.info(f"Retrying in {wait_time}s...")
-                await asyncio.sleep(wait_time)
-
-        # Apply stealth patches AFTER the first navigation.
-        # In Docker, applying stealth init scripts before navigation
-        # causes Chrome's DNS resolver to fail (ERR_NAME_NOT_RESOLVED).
-        await _browser.apply_stealth_patches()
-
-        await asyncio.sleep(3)
-
-        if not await _browser.is_logged_in():
-            log.info("Not logged in — starting auto-login flow...")
-            logged_in = await ensure_logged_in(_browser)
-            if not logged_in:
-                log.error("Login failed after auto-login attempt")
-                raise RuntimeError(f"Could not log in to {provider_name}")
-
-        if Config.PROVIDER == "claude":
-            _client = ClaudeClient(page)
-        else:
-            _client = ChatGPTClient(page)
-
-    set_client(_client, _browser)
-    set_openai_client(_client, _browser)
-    log.info(f"API server ready for {provider_name}")
-
-    yield  # Server is running
-
-    if _browser is not None:
-        log.info("Shutting down — closing browser...")
-        await _browser.close()
-        log.info("Browser closed")
+        _client = None
 
 
 app = FastAPI(

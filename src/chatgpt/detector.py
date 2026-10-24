@@ -132,7 +132,7 @@ async def _latest_assistant_turn_snapshot(page: Page) -> dict:
                 document.querySelector('.result-streaming, [data-is-streaming="true"], .streaming')
             );
             const isPageStreaming = hasStopButton || hasPageStreamingClass;
-
+            console.log(turns);
             for (let idx = turns.length - 1; idx >= 0; idx--) {
                 const turn = turns[idx];
                 const turnRole = turn.getAttribute('data-turn');
@@ -152,6 +152,7 @@ async def _latest_assistant_turn_snapshot(page: Page) -> dict:
 
                 const hasCopyButton = Boolean(
                     turn.querySelector('button[aria-label="Copy response"]') ||
+                    turn.querySelector('button[aria-label="Copy"]') ||
                     turn.querySelector('button[data-testid="copy-turn-action-button"]') ||
                     turn.querySelector('button[aria-label="Copy message"]')
                 );

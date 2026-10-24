@@ -16,7 +16,7 @@ from src.log import setup_logging
 log = setup_logging("auto_login")
 
 
-async def ensure_logged_in(browser: BrowserManager) -> bool:
+async def ensure_logged_in(browser: BrowserManager, provider: str | None = None, page=None) -> bool:
     """
     Check if the user is logged in. If not, guide them through login.
 
@@ -27,14 +27,15 @@ async def ensure_logged_in(browser: BrowserManager) -> bool:
     Returns True if logged in (or successfully logged in now).
     Raises RuntimeError if login fails after the user presses Enter.
     """
-    if await browser.is_logged_in():
+    if await browser.is_logged_in(provider=provider, page=page):
         log.info("Already logged in")
         return True
 
     log.info("Not logged in — starting interactive login flow")
 
-    provider_name = "Claude" if Config.PROVIDER == "claude" else "ChatGPT"
-    target_url = Config.provider_url()
+    provider = provider or Config.PROVIDER
+    provider_name = "Claude" if provider == "claude" else "ChatGPT"
+    target_url = Config.provider_url(provider)
 
     print("\n" + "=" * 60)
     print(f"  🔐 {provider_name} Login Required — First-Time Setup")
@@ -57,7 +58,7 @@ async def ensure_logged_in(browser: BrowserManager) -> bool:
     await asyncio.sleep(2)
 
     # Verify login
-    if await browser.is_logged_in():
+    if await browser.is_logged_in(provider=provider, page=page):
         print("\n  ✅ Login verified! Session saved.")
         print("  You won't need to sign in again.\n")
         log.info("Interactive login completed successfully")

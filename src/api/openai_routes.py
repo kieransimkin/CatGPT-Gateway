@@ -60,6 +60,9 @@ openai_router = APIRouter()
 # Global references — set by server.py at startup
 _client: ChatGPTClient | ClaudeClient | MiniMaxClient | None = None
 _browser: Any = None
+_clients_by_model: dict[str, ChatGPTClient | ClaudeClient | MiniMaxClient] = {}
+_page_pools: dict[str, BrowserPagePool] = {}
+_session_managers: dict[str, PersistentSessionManager] = {}
 
 
 class BrowserPagePool:
@@ -68,7 +71,9 @@ class BrowserPagePool:
     Each request executes in its own isolated page/tab, preventing crosstalk and prompt bloat.
     """
 
-    def __init__(self, browser: Any = None, max_concurrency: int = 3):
+    def __init__(self, browser: Any = None, max_concurrency: int = 3,
+                 provider: str = "chatgpt"):
+        self._provider = provider
         self._browser = browser
         self._semaphore = asyncio.Semaphore(max_concurrency)
         self._pool: asyncio.Queue[Page] = asyncio.Queue()
@@ -80,7 +85,7 @@ class BrowserPagePool:
     @asynccontextmanager
     async def acquire_clean_page(self):
         """Acquire a fresh, stateless Page ready at ChatGPT / Claude."""
-        if not Config.uses_browser():
+        if not Config.uses_browser(self._provider):
             yield None
             return
 
@@ -106,7 +111,7 @@ class BrowserPagePool:
                     raise RuntimeError("Browser context unavailable")
 
             # 2. Ensure page is at the provider URL and in a fresh chat state
-            target_url = Config.provider_url()
+            target_url = Config.provider_url(self._provider)
             current_url = page.url or ""
 
             if target_url not in current_url and not current_url.startswith(target_url):
@@ -171,7 +176,8 @@ class PersistentSessionManager:
       next request.
     """
 
-    def __init__(self, browser: Any = None):
+    def __init__(self, browser: Any = None, provider: str = "chatgpt"):
+        self._provider = provider
         self._browser = browser
 
         # session_id → open Page object (only sessions with an open tab)
@@ -224,7 +230,7 @@ class PersistentSessionManager:
                     try:
                         # Save URL before closing
                         url = page.url or ""
-                        if "/c/" in url:
+                        if "/c/" in url or "/chat/" in url:
                             self._session_urls[sid] = url
                         await page.close()
                         log.info(
@@ -240,10 +246,10 @@ class PersistentSessionManager:
     # ── URL tracking ─────────────────────────────────────────────────────────
 
     async def _save_conversation_url(self, session_id: str, page: Page) -> None:
-        """Extract and persist the ChatGPT conversation URL from page after send."""
+        """Persist ChatGPT /c/ and Claude /chat/ conversation URLs."""
         try:
             url = page.url or ""
-            if "/c/" in url:
+            if "/c/" in url or "/chat/" in url:
                 self._session_urls[session_id] = url
                 log.debug(f"[Session] Saved URL for '{session_id}': {url}")
         except Exception:
@@ -324,7 +330,7 @@ class PersistentSessionManager:
                         known_url = None
 
                 if not known_url:
-                    target_url = Config.provider_url()
+                    target_url = Config.provider_url(self._provider)
                     await page.goto(
                         target_url, wait_until="domcontentloaded", timeout=25000
                     )
@@ -345,12 +351,13 @@ class PersistentSessionManager:
 _session_manager: PersistentSessionManager | None = None
 
 
-def _get_session_manager() -> PersistentSessionManager:
+def _get_session_manager(model_id: str | None = None) -> PersistentSessionManager:
     global _session_manager
+    if model_id is not None and model_id in _session_managers:
+        return _session_managers[model_id]
     if _session_manager is None:
         _session_manager = PersistentSessionManager(_browser)
     return _session_manager
-
 
 def _extract_session_id(raw_request: Request | None, body_user: str | None = None) -> str | None:
     """Extract session ID from request headers or body user field."""
@@ -368,6 +375,7 @@ def _extract_persistent_prompt(
     messages: list[ChatMessage],
     is_first_turn: bool,
     has_tool_prompt: bool = False,
+    provider: str = "chatgpt",
 ) -> tuple[str, list[ChatMessage]]:
     """
     In persistent mode, the webpage itself remembers history.
@@ -378,7 +386,7 @@ def _extract_persistent_prompt(
         return "", []
 
     if is_first_turn:
-        return _build_prompt(messages), messages
+        return _build_prompt(messages, provider=provider), messages
 
     # Subsequent turns: Extract latest user turn (and any tool results directly associated with it)
     latest_msgs: list[ChatMessage] = []
@@ -391,7 +399,7 @@ def _extract_persistent_prompt(
     if not latest_msgs:
         latest_msgs = [messages[-1]]
 
-    pruned_prompt = _build_prompt(latest_msgs)
+    pruned_prompt = _build_prompt(latest_msgs, provider=provider)
     log.info(
         f"[Persistent Session] Pruned history: original {len(messages)} messages "
         f"-> {len(latest_msgs)} latest message(s) ({len(pruned_prompt)} chars)"
@@ -399,34 +407,65 @@ def _extract_persistent_prompt(
     return pruned_prompt, latest_msgs
 
 
-def _get_page_pool() -> BrowserPagePool:
+def _get_page_pool(model_id: str | None = None) -> BrowserPagePool:
     global _page_pool
+    if model_id is not None and model_id in _page_pools:
+        return _page_pools[model_id]
     if _page_pool is None:
         _page_pool = BrowserPagePool(_browser, max_concurrency=Config.MAX_CONCURRENT_REQUESTS)
     return _page_pool
 
 
 def _resolve_model_id(requested: str | None) -> str:
-    """Resolve a request model against the active provider mapping."""
     try:
-        return Config.resolve_model_id(requested)
+        model_id = Config.resolve_model_id(requested)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if _clients_by_model and model_id not in _clients_by_model:
+        raise HTTPException(status_code=503, detail=f"Model {model_id!r} not ready")
+    return model_id
+
+
+def set_openai_clients(
+    clients: dict[str, ChatGPTClient | ClaudeClient | MiniMaxClient],
+    browser: Any = None,
+) -> None:
+    """Install ready models and isolate pool/session state by model identifier."""
+    global _client, _browser, _page_pool, _session_manager
+    global _clients_by_model, _page_pools, _session_managers
+    _clients_by_model = dict(clients)
+    _browser = browser
+    _client = clients.get(Config.DEFAULT_MODEL) or next(iter(clients.values()), None)
+    _page_pools = {}
+    _session_managers = {}
+    for model_id in clients:
+        provider = Config.model_provider(model_id)
+        _page_pools[model_id] = BrowserPagePool(
+            browser, max_concurrency=Config.MAX_CONCURRENT_REQUESTS,
+            provider=provider,
+        )
+        if Config.uses_browser(provider):
+            _session_managers[model_id] = PersistentSessionManager(browser, provider=provider)
+    _page_pool = _page_pools.get(Config.DEFAULT_MODEL)
+    _session_manager = _session_managers.get(Config.DEFAULT_MODEL)
 
 
 def set_openai_client(
-    client: ChatGPTClient | ClaudeClient | MiniMaxClient,
-    browser: Any = None,
+    client: ChatGPTClient | ClaudeClient | MiniMaxClient, browser: Any = None
 ) -> None:
-    """Called by server.py to inject the client and browser."""
-    global _client, _browser, _page_pool, _session_manager
-    _client = client
-    _browser = browser
-    _page_pool = BrowserPagePool(browser, max_concurrency=Config.MAX_CONCURRENT_REQUESTS)
-    _session_manager = PersistentSessionManager(browser)
+    """Legacy single-client injection for older scripts and tests."""
+    model = {"claude": "claude-browser", "minimax": Config.MINIMAX_MODEL}.get(
+        Config.PROVIDER, "catgpt-browser"
+    )
+    set_openai_clients({model: client}, browser)
 
 
-def _get_client() -> ChatGPTClient | ClaudeClient | MiniMaxClient:
+def _get_client(model_id: str | None = None) -> ChatGPTClient | ClaudeClient | MiniMaxClient:
+    if model_id is not None and _clients_by_model:
+        client = _clients_by_model.get(model_id)
+        if client is None:
+            raise HTTPException(status_code=503, detail=f"Model {model_id!r} is not ready")
+        return client
     if _client is None:
         raise HTTPException(status_code=503, detail="Client not initialized")
     return _client
@@ -607,7 +646,7 @@ async def _download_file(url_or_data: str | dict, download_dir: str = "/tmp/catg
         return None
 
 
-def _build_prompt(messages: list[ChatMessage]) -> str:
+def _build_prompt(messages: list[ChatMessage], provider: str = "chatgpt") -> str:
     """
     Flatten an OpenAI-style message array into a single prompt string
     that we can paste into ChatGPT's input box.
@@ -626,7 +665,7 @@ def _build_prompt(messages: list[ChatMessage]) -> str:
         prefix = ""
         if system_msgs:
             sys_text = _extract_content_text(system_msgs[0].content)
-            if Config.PROVIDER == "claude":
+            if provider == "claude":
                 # Claude rejects "[System instruction: ...]" as prompt injection.
                 # Present it as context instead.
                 prefix = f"{sys_text}\n\n"
@@ -640,7 +679,7 @@ def _build_prompt(messages: list[ChatMessage]) -> str:
     for msg in messages:
         role = msg.role.capitalize()
         if msg.role == "system":
-            if Config.PROVIDER == "claude":
+            if provider == "claude":
                 # For Claude, present system messages as context without the label
                 text = _extract_content_text(msg.content)
                 if text:
@@ -652,7 +691,7 @@ def _build_prompt(messages: list[ChatMessage]) -> str:
         elif msg.role == "tool":
             # Tool result — include both the call context and the result
             tool_content = _extract_content_text(msg.content)
-            if Config.PROVIDER == "claude":
+            if provider == "claude":
                 parts.append(
                     f"The tool was executed and returned this result:\n{tool_content}\n\n"
                     f"Now use the result above to answer the user's original question in plain text."
@@ -681,6 +720,7 @@ def _build_prompt(messages: list[ChatMessage]) -> str:
 def _build_tool_system_prompt(
     tools: list[ToolDefinition],
     tool_choice: str | dict | None = None,
+    provider: str = "chatgpt",
 ) -> str:
     """
     Build a system-level instruction that tells the model about available tools.
@@ -732,7 +772,7 @@ def _build_tool_system_prompt(
         )
 
     # ── Provider-specific prompt framing ──
-    if Config.PROVIDER == "claude":
+    if provider == "claude":
         return f"""You have access to external tools through a structured interface. {decision}
 
 When calling tools, respond with ONLY a JSON code block — no text before or after it:
@@ -909,11 +949,15 @@ def _parse_tool_calls(
 @openai_router.get("/v1/models", response_model=ModelListResponse)
 async def list_models() -> ModelListResponse:
     """List models exposed by the active provider."""
-    owned_by = Config.provider_owner()
     return ModelListResponse(
         data=[
-            ModelObject(id=model_id, owned_by=owned_by)
-            for model_id in Config.provider_model_ids()
+            ModelObject(
+                id=model_id,
+                owned_by={"chatgpt": "catgpt", "claude": "anthropic", "minimax": "minimax"}[
+                    Config.model_provider(model_id)
+                ],
+            )
+            for model_id in _clients_by_model
         ]
     )
 
@@ -934,15 +978,15 @@ async def create_image(
     if not request.prompt:
         raise HTTPException(status_code=400, detail="prompt cannot be empty")
 
-    if not Config.supports_image_generation():
+    if "catgpt-browser" not in _clients_by_model:
         raise HTTPException(
             status_code=501,
             detail="Image generation is not supported by the active provider.",
         )
 
-    client = _get_client()
+    client = _get_client("catgpt-browser")
 
-    async with _get_page_pool().acquire_clean_page() as page:
+    async with _get_page_pool("catgpt-browser").acquire_clean_page() as page:
         start_time = time.time()
 
         # Build an image-generation prompt.
@@ -967,7 +1011,7 @@ async def create_image(
 
         # Send to ChatGPT
         try:
-            result = await client.send_message(full_prompt)
+            result = await client.send_message(full_prompt, page=page)
         except Exception as e:
             log.error(f"Provider error during image generation: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Provider error: {str(e)}")
@@ -1158,7 +1202,9 @@ async def create_chat_completion(
     if not request.messages:
         raise HTTPException(status_code=400, detail="messages array cannot be empty")
 
-    if Config.PROVIDER == "minimax" and any(
+    model_id = _resolve_model_id(request.model)
+    provider = Config.model_provider(model_id)
+    if provider == "minimax" and any(
         _contains_attachment(message.content) for message in request.messages
     ):
         raise HTTPException(
@@ -1166,17 +1212,16 @@ async def create_chat_completion(
             detail="Attachments are not supported by the MiniMax provider.",
         )
 
-    client = _get_client()
-    model_id = _resolve_model_id(request.model)
+    client = _get_client(model_id)
     session_id = _extract_session_id(raw_request, getattr(request, "user", None))
 
-    if session_id:
-        page_cm = _get_session_manager().acquire_session_page(session_id)
+    if session_id and Config.uses_browser(provider):
+        page_cm = _get_session_manager(model_id).acquire_session_page(session_id)
         is_persistent = True
     else:
         @asynccontextmanager
         async def _stateless_cm():
-            async with _get_page_pool().acquire_clean_page() as p:
+            async with _get_page_pool(model_id).acquire_clean_page() as p:
                 yield p, False
         page_cm = _stateless_cm()
         is_persistent = False
@@ -1190,17 +1235,17 @@ async def create_chat_completion(
         has_tool_prompt = False
         if request.tools and request.tool_choice != "none":
             tool_system = _build_tool_system_prompt(
-                request.tools, tool_choice=request.tool_choice
+                request.tools, tool_choice=request.tool_choice, provider=provider
             )
             messages.insert(0, ChatMessage(role="system", content=tool_system))
             has_tool_prompt = True
 
         if is_persistent:
             prompt, active_messages = _extract_persistent_prompt(
-                messages, is_first_turn, has_tool_prompt
+                messages, is_first_turn, has_tool_prompt, provider=provider
             )
         else:
-            prompt = _build_prompt(messages)
+            prompt = _build_prompt(messages, provider=provider)
             active_messages = messages
 
         log.info(
@@ -1300,7 +1345,7 @@ async def create_chat_completion(
         # ── Detect echo (extraction grabbed sent prompt instead of reply) ──
         _echo_markers = ["[System instruction:", "tool-calling mode", "Available functions:"]
         if (
-            Config.uses_browser()
+            Config.uses_browser(provider)
             and response_text
             and has_tool_prompt
             and any(m in response_text for m in _echo_markers)
@@ -1308,11 +1353,11 @@ async def create_chat_completion(
             log.warning("Response appears to echo the sent prompt — retrying extraction")
             try:
                 await asyncio.sleep(1.5)
-                if Config.PROVIDER == "claude":
+                if provider == "claude":
                     from src.claude.detector import extract_last_response_via_copy
                 else:
                     from src.chatgpt.detector import extract_last_response_via_copy
-                retry_text = await extract_last_response_via_copy(client.page)
+                retry_text = await extract_last_response_via_copy(page)
                 if retry_text and not any(m in retry_text for m in _echo_markers):
                     response_text = retry_text
                     log.info(f"Retry extraction succeeded: {len(response_text)} chars")
@@ -1729,23 +1774,24 @@ async def create_response(
     if not request.input:
         raise HTTPException(status_code=400, detail="input cannot be empty")
 
-    if Config.PROVIDER == "minimax" and _contains_attachment(request.input):
+    model_id = _resolve_model_id(request.model)
+    provider = Config.model_provider(model_id)
+    if provider == "minimax" and _contains_attachment(request.input):
         raise HTTPException(
             status_code=501,
             detail="Attachments are not supported by the MiniMax provider.",
         )
 
-    client = _get_client()
-    model_id = _resolve_model_id(request.model)
+    client = _get_client(model_id)
     session_id = _extract_session_id(raw_request, getattr(request, "user", None))
 
-    if session_id:
-        page_cm = _get_session_manager().acquire_session_page(session_id)
+    if session_id and Config.uses_browser(provider):
+        page_cm = _get_session_manager(model_id).acquire_session_page(session_id)
         is_persistent = True
     else:
         @asynccontextmanager
         async def _stateless_cm():
-            async with _get_page_pool().acquire_clean_page() as p:
+            async with _get_page_pool(model_id).acquire_clean_page() as p:
                 yield p, False
         page_cm = _stateless_cm()
         is_persistent = False
@@ -1769,7 +1815,7 @@ async def create_response(
             chat_tools = _responses_tools_to_chat_tools(raw_tools)
             if chat_tools and request.tool_choice != "none":
                 tool_system = _build_tool_system_prompt(
-                    chat_tools, tool_choice=request.tool_choice
+                    chat_tools, tool_choice=request.tool_choice, provider=provider
                 )
                 messages.insert(
                     0, ChatMessage(role="system", content=tool_system)
@@ -1778,10 +1824,10 @@ async def create_response(
 
         if is_persistent:
             prompt, _ = _extract_persistent_prompt(
-                messages, is_first_turn, has_tool_prompt
+                messages, is_first_turn, has_tool_prompt, provider=provider
             )
         else:
-            prompt = _build_prompt(messages)
+            prompt = _build_prompt(messages, provider=provider)
 
         log.info(
             f"POST /v1/responses — model={model_id}, "
@@ -1803,13 +1849,14 @@ async def create_response(
                 # Page has a DNS/navigation error or UI is broken — attempt recovery
                 log.warning(f"Page error detected, attempting recovery: {e}")
                 from src.api.server import _browser
-                if _browser and await _browser.recover_page():
+                if _browser and await _browser.recover_page(page=page, provider=provider):
                     # Retry after recovery
                     try:
                         result = await client.send_message(
                             prompt,
                             model=model_id,
-                            stateless=not Config.uses_browser(),
+                            stateless=not is_persistent,
+                            page=page,
                         )
                     except Exception as e2:
                         log.error(f"Provider error after recovery: {e2}", exc_info=True)
@@ -1831,12 +1878,13 @@ async def create_response(
             if "TargetClosed" in err_name or "closed" in str(e).lower():
                 log.warning(f"Browser/page crashed ({err_name}), attempting recovery...")
                 from src.api.server import _browser
-                if _browser and await _browser.recover_page():
+                if _browser and await _browser.recover_page(page=page, provider=provider):
                     try:
                         result = await client.send_message(
                             prompt,
                             model=model_id,
-                            stateless=not Config.uses_browser(),
+                            stateless=not is_persistent,
+                            page=page,
                         )
                     except Exception as e2:
                         log.error(f"Provider error after crash recovery: {e2}", exc_info=True)
@@ -1863,7 +1911,7 @@ async def create_response(
             "Available functions:",
         ]
         if (
-            Config.uses_browser()
+            Config.uses_browser(provider)
             and response_text
             and has_tool_prompt
             and any(m in response_text for m in _echo_markers)
@@ -1873,12 +1921,12 @@ async def create_response(
             )
             try:
                 await asyncio.sleep(1.5)
-                if Config.PROVIDER == "claude":
+                if provider == "claude":
                     from src.claude.detector import extract_last_response_via_copy
                 else:
                     from src.chatgpt.detector import extract_last_response_via_copy
 
-                retry_text = await extract_last_response_via_copy(client.page)
+                retry_text = await extract_last_response_via_copy(page)
                 if retry_text and not any(
                     m in retry_text for m in _echo_markers
                 ):
@@ -1977,17 +2025,18 @@ async def create_anthropic_message(request: Request):
             content_str = str(content)
         chat_messages.append(ChatMessage(role=role, content=content_str))
 
-    client = _get_client()
     model_id = _resolve_model_id(model)
+    provider = Config.model_provider(model_id)
+    client = _get_client(model_id)
     session_id = _extract_session_id(request, body.get("user") or body.get("session_id"))
 
-    if session_id:
-        page_cm = _get_session_manager().acquire_session_page(session_id)
+    if session_id and Config.uses_browser(provider):
+        page_cm = _get_session_manager(model_id).acquire_session_page(session_id)
         is_persistent = True
     else:
         @asynccontextmanager
         async def _stateless_cm():
-            async with _get_page_pool().acquire_clean_page() as p:
+            async with _get_page_pool(model_id).acquire_clean_page() as p:
                 yield p, False
         page_cm = _stateless_cm()
         is_persistent = False
@@ -1995,9 +2044,9 @@ async def create_anthropic_message(request: Request):
     async with page_cm as (page, is_first_turn):
         start_time = time.time()
         if is_persistent:
-            prompt, _ = _extract_persistent_prompt(chat_messages, is_first_turn)
+            prompt, _ = _extract_persistent_prompt(chat_messages, is_first_turn, provider=provider)
         else:
-            prompt = _build_prompt(chat_messages)
+            prompt = _build_prompt(chat_messages, provider=provider)
 
         log.info(
             f"POST /v1/messages — model={model_id}, "
@@ -2098,11 +2147,11 @@ async def get_open_tabs():
         return {"tabs": [], "sessions": [], "active_tabs": 0, "max_active_tabs": Config.MAX_ACTIVE_TABS}
 
     # Build a reverse map: Page → session_id for annotation
-    page_to_session: dict[int, str] = {}
-    if _session_manager:
-        for sid, p in _session_manager._pages.items():
+    page_to_session: dict[int, tuple[str, str]] = {}
+    for model_id, manager in _session_managers.items():
+        for sid, p in manager._pages.items():
             if p and not p.is_closed():
-                page_to_session[id(p)] = sid
+                page_to_session[id(p)] = (model_id, sid)
 
     tabs = []
     for idx, p in enumerate(context.pages):
@@ -2113,24 +2162,35 @@ async def get_open_tabs():
                 title = await asyncio.wait_for(p.title(), timeout=0.8)
             except Exception:
                 pass
-            session_id = page_to_session.get(id(p))
+            model_id, session_id = page_to_session.get(id(p), (None, None))
+            if model_id is None:
+                if url.startswith(Config.CHATGPT_URL):
+                    model_id = "catgpt-browser"
+                elif url.startswith(Config.CLAUDE_URL):
+                    model_id = "claude-browser"
             tab_info: dict = {
                 "index": idx,
                 "url": url,
                 "title": title or f"Tab #{idx}",
                 "session_id": session_id,
+                "model": model_id,
             }
-            if session_id and _session_manager:
-                last_used = _session_manager._lru.get(session_id)
+            if session_id and model_id in _session_managers:
+                manager = _session_managers[model_id]
+                last_used = manager._lru.get(session_id)
                 if last_used is not None:
                     tab_info["last_used_seconds_ago"] = int(time.monotonic() - last_used)
-                conv_url = _session_manager._session_urls.get(session_id)
+                conv_url = manager._session_urls.get(session_id)
                 if conv_url:
                     tab_info["conversation_url"] = conv_url
             tabs.append(tab_info)
 
     # All known sessions (including those whose tab is currently closed)
-    sessions = _session_manager.session_info() if _session_manager else []
+    sessions = [
+        {**session, "model": model_id}
+        for model_id, manager in _session_managers.items()
+        for session in manager.session_info()
+    ]
 
     return {
         "tabs": tabs,
@@ -2157,24 +2217,22 @@ async def close_tab(tab: int = 0):
     if len(context.pages) <= 1:
         # Don't close the last remaining tab to preserve browser context; navigate to home
         try:
-            await target_page.goto(Config.provider_url(), wait_until="domcontentloaded", timeout=10000)
+            url = target_page.url or ""
+            provider = "claude" if url.startswith(Config.CLAUDE_URL) else "chatgpt"
+            await target_page.goto(Config.provider_url(provider), wait_until="domcontentloaded", timeout=10000)
             return {"status": "reset", "message": "Only 1 tab remained; reset to homepage"}
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to reset page: {e}")
 
-    # Remove from session manager if associated; preserve URL mapping for later restore
-    if _session_manager:
-        for sid, p in list(_session_manager._pages.items()):
+    # Remove from the matching model's session registry, preserving URL.
+    for model_id, manager in _session_managers.items():
+        for sid, p in list(manager._pages.items()):
             if p == target_page:
-                # Save current conversation URL before closing
                 url = target_page.url or ""
-                if "/c/" in url:
-                    _session_manager._session_urls[sid] = url
-                _session_manager._pages.pop(sid, None)
-                log.info(
-                    f"User closed tab for session '{sid}' via monitor "
-                    f"(URL preserved: {_session_manager._session_urls.get(sid, 'none')})"
-                )
+                if "/c/" in url or "/chat/" in url:
+                    manager._session_urls[sid] = url
+                manager._pages.pop(sid, None)
+                log.info("User closed %s tab for session %s", model_id, sid)
                 break
 
     try:

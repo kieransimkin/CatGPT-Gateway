@@ -57,15 +57,59 @@ class Config:
         "MINIMAX_MODEL", MINIMAX_MODEL_IDS[0]
     ).strip()
 
-    # Provider selection
+    # Provider selection for the legacy CLI/TUI only. The API server uses
+    # an independent model registry and never consults this as a global switch.
     PROVIDER: str = os.getenv("PROVIDER", "chatgpt").lower()
+    ALL_MODEL_IDS: tuple[str, ...] = ("catgpt-browser", "claude-browser") + MINIMAX_MODEL_IDS
+    ENABLED_MODELS: tuple[str, ...] = tuple(
+        model.strip() for model in os.getenv(
+            "ENABLED_MODELS", "catgpt-browser,claude-browser,MiniMax-M2.7"
+        ).split(",") if model.strip()
+    )
+    DEFAULT_MODEL: str = os.getenv("DEFAULT_MODEL", "catgpt-browser").strip()
 
     @classmethod
-    def provider_url(cls) -> str:
+    def model_provider(cls, model: str) -> str:
+        if model == "catgpt-browser":
+            return "chatgpt"
+        if model == "claude-browser":
+            return "claude"
+        if model in cls.MINIMAX_MODEL_IDS:
+            return "minimax"
+        raise ValueError(f"Unknown model {model!r}; supported: {', '.join(cls.ALL_MODEL_IDS)}")
+
+    @classmethod
+    def available_models(cls) -> tuple[str, ...]:
+        """Models that can be started, excluding unconfigured API providers."""
+        return tuple(
+            model for model in cls.ENABLED_MODELS
+            if cls.model_provider(model) != "minimax" or bool(cls.MINIMAX_API_KEY)
+        )
+
+    @classmethod
+    def validate_models(cls) -> None:
+        if not cls.ENABLED_MODELS:
+            raise ValueError("ENABLED_MODELS cannot be empty")
+        if len(set(cls.ENABLED_MODELS)) != len(cls.ENABLED_MODELS):
+            raise ValueError("ENABLED_MODELS has duplicates")
+        for model in cls.ENABLED_MODELS:
+            cls.model_provider(model)
+        if cls.DEFAULT_MODEL not in cls.available_models():
+            raise ValueError(
+                f"DEFAULT_MODEL {cls.DEFAULT_MODEL!r} is not available. "
+                "Enable it and configure its API credentials if applicable."
+            )
+        if cls.MINIMAX_REGION not in cls.MINIMAX_BASE_URLS and not os.getenv("MINIMAX_BASE_URL", "").strip():
+            raise ValueError(f"Unsupported MINIMAX_REGION {cls.MINIMAX_REGION!r}")
+
+
+    @classmethod
+    def provider_url(cls, provider: str | None = None) -> str:
         """Return the target URL for the active provider."""
-        if cls.PROVIDER == "claude":
+        provider = provider or cls.PROVIDER
+        if provider == "claude":
             return cls.CLAUDE_URL
-        if cls.PROVIDER == "minimax":
+        if provider == "minimax":
             return cls.MINIMAX_BASE_URL
         return cls.CHATGPT_URL
 
@@ -106,9 +150,9 @@ class Config:
                 )
 
     @classmethod
-    def uses_browser(cls) -> bool:
-        """Return whether the active provider requires browser automation."""
-        return cls.PROVIDER != "minimax"
+    def uses_browser(cls, provider: str | None = None) -> bool:
+        """Whether the named provider needs a browser (legacy default supported)."""
+        return (provider or cls.PROVIDER) != "minimax"
 
     @classmethod
     def provider_model_ids(cls) -> tuple[str, ...]:
@@ -128,18 +172,14 @@ class Config:
 
     @classmethod
     def resolve_model_id(cls, requested: str | None) -> str:
-        """Resolve request defaults and validate MiniMax model IDs."""
-        if cls.PROVIDER != "minimax":
-            return requested or cls.default_model_id()
-
-        if not requested or requested in {"catgpt-browser", "claude-browser"}:
-            return cls.MINIMAX_MODEL
-        if requested not in cls.MINIMAX_MODEL_IDS:
-            supported = ", ".join(cls.MINIMAX_MODEL_IDS)
+        """Resolve and strictly validate a request against live model IDs."""
+        model = requested or cls.DEFAULT_MODEL
+        if model not in cls.available_models():
             raise ValueError(
-                f"Unsupported MiniMax model '{requested}'. Choose one of: {supported}"
+                f"Model {model!r} is unavailable. Available models: "
+                f"{', '.join(cls.available_models())}"
             )
-        return requested
+        return model
 
     @classmethod
     def provider_owner(cls) -> str:

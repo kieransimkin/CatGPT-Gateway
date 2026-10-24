@@ -379,7 +379,7 @@ class BrowserManager:
         await self.page.goto(url, wait_until="domcontentloaded")
         log.info("Page loaded")
 
-    async def recover_page(self) -> bool:
+    async def recover_page(self, page: Page | None = None, provider: str = "chatgpt") -> bool:
         """Recover from DNS / page errors by re-navigating to ChatGPT.
 
         Tries JS navigation first (avoids DNS lookup), then page.goto().
@@ -387,16 +387,17 @@ class BrowserManager:
         """
         import asyncio as _asyncio
 
-        if self._page is None:
+        target_page = page if page is not None else self._page
+        if target_page is None:
             return False
 
         # Strategy 1: JS navigation (doesn't go through Chrome's DNS resolver)
         try:
             log.info("Page recovery via JS navigation...")
-            await self._page.evaluate(f"window.location.href = '{Config.CHATGPT_URL}'")
-            await self._page.wait_for_load_state("domcontentloaded", timeout=15000)
+            await target_page.evaluate(f"window.location.href = '{Config.provider_url(provider)}'")
+            await target_page.wait_for_load_state("domcontentloaded", timeout=15000)
             await _asyncio.sleep(1)
-            error = await self._page.evaluate(
+            error = await target_page.evaluate(
                 """
                 () => {
                     const body = document.body ? document.body.innerText : '';
@@ -418,14 +419,14 @@ class BrowserManager:
         for attempt in range(1, 4):
             try:
                 log.info(f"Page recovery attempt {attempt}/3 (page.goto)...")
-                await self._page.goto(
-                    Config.CHATGPT_URL,
+                await target_page.goto(
+                    Config.provider_url(provider),
                     wait_until="domcontentloaded",
                     timeout=30000,
                 )
                 await _asyncio.sleep(1)
 
-                error = await self._page.evaluate(
+                error = await target_page.evaluate(
                     """
                     () => {
                         const body = document.body ? document.body.innerText : '';
@@ -451,7 +452,7 @@ class BrowserManager:
         log.error("Page recovery failed after all attempts")
         return False
 
-    async def is_logged_in(self) -> bool:
+    async def is_logged_in(self, provider: str | None = None, page: Page | None = None) -> bool:
         """
         Check if user is logged in by looking for chat input vs login indicators.
 
@@ -460,7 +461,8 @@ class BrowserManager:
         from src.selectors import Selectors
         from src.claude.selectors import ClaudeSelectors
 
-        if Config.PROVIDER == "claude":
+        target_page = page if page is not None else self.page
+        if (provider or Config.PROVIDER) == "claude":
             chat_inputs = ClaudeSelectors.CHAT_INPUT
             login_indicators = ClaudeSelectors.LOGIN_INDICATORS
             logged_in_indicators = ClaudeSelectors.LOGGED_IN_INDICATORS
@@ -473,7 +475,7 @@ class BrowserManager:
             # Try to find the chat input
             for selector in chat_inputs:
                 try:
-                    el = await self.page.wait_for_selector(selector, timeout=3000)
+                    el = await target_page.wait_for_selector(selector, timeout=3000)
                     if el:
                         log.info("Login check: LOGGED IN (chat input found)")
                         return True
@@ -483,7 +485,7 @@ class BrowserManager:
             # Claude: also check for user-menu-button as a logged-in signal
             for selector in logged_in_indicators:
                 try:
-                    el = await self.page.wait_for_selector(selector, timeout=2000)
+                    el = await target_page.wait_for_selector(selector, timeout=2000)
                     if el:
                         log.info("Login check: LOGGED IN (user menu found)")
                         return True
@@ -493,7 +495,7 @@ class BrowserManager:
             # Check for login indicators
             for selector in login_indicators:
                 try:
-                    el = await self.page.wait_for_selector(selector, timeout=2000)
+                    el = await target_page.wait_for_selector(selector, timeout=2000)
                     if el:
                         log.warning("Login check: NOT LOGGED IN (login button found)")
                         return False

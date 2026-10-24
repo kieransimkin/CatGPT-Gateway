@@ -59,8 +59,13 @@ class MiniMaxClient:
         file_paths: list[str] | None = None,
         model: str | None = None,
         stateless: bool = False,
+        page: Any = None,
     ) -> ChatResponse:
-        """Send a text message and return a normalized provider response."""
+        """Send a text message and return a normalized provider response.
+
+        ``page`` is unused for this API-backed provider; accepted for the
+        shared OpenAI route send_message interface.
+        """
         if image_paths or file_paths:
             raise RuntimeError(
                 "File attachments are not supported by the MiniMax provider client"

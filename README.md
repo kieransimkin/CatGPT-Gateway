@@ -75,7 +75,7 @@ That's it. Your Claude or ChatGPT subscription just became an API.
 
 ## Providers
 
-CatGPT Gateway supports two providers. Set `PROVIDER` in your `.env` file to switch.
+CatGPT Gateway supports concurrent ChatGPT, Claude, and MiniMax models through the OpenAI API. The legacy `PROVIDER` setting affects only older CLI scripts.
 
 ### Claude (`PROVIDER=claude`)
 
@@ -369,3 +369,40 @@ MIT License. See [LICENSE](LICENSE) for details.
     <img src="https://img.shields.io/github/stars/GautamVhavle/CatGPT-Gateway?style=social" alt="Star on GitHub" />
   </a>
 </p>
+
+
+## Simultaneous providers (new OpenAI-compatible gateway)
+
+The API server now runs both browser-backed providers concurrently in one
+Chrome profile, using separate tabs, per-model page pools and per-model
+persistent sessions. MiniMax runs through its **official HTTP API**, without
+a browser tab. The legacy `PROVIDER` variable is ignored by the API server
+(although legacy CLI scripts may still use it).
+
+```dotenv
+ENABLED_MODELS=catgpt-browser,claude-browser,MiniMax-M2.7
+DEFAULT_MODEL=catgpt-browser
+MINIMAX_API_KEY=your-minimax-key   # optional; omitted model when unset
+```
+
+`GET /v1/models` lists the models available in the running server. When
+MiniMax credentials have not been configured, the MiniMax model is omitted
+rather than making the browser models unavailable. Login is checked
+independently for the ChatGPT and Claude tabs at server startup.
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="your-API_TOKEN")
+print([model.id for model in client.models.list()])
+for model in ("catgpt-browser", "claude-browser", "MiniMax-M2.7"):
+    # MiniMax requires MINIMAX_API_KEY to be set in the gateway.
+    print(model, client.chat.completions.create(
+        model=model, messages=[{"role": "user", "content": "Hello"}]
+    ).choices[0].message.content)
+```
+
+The `model` field chooses the provider independently for each request on
+`/v1/chat/completions`, `/v1/responses` and `/v1/messages`. Session IDs are
+isolated per browser model, even when they use the same identifier. API-backed
+MiniMax requests are stateless and include any supplied history in the prompt.
+The legacy `/chat` and `/thread/*` endpoints continue using `DEFAULT_MODEL`.

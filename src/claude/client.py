@@ -55,6 +55,7 @@ class ClaudeClient:
         file_paths: list[str] | None = None,
         model: str | None = None,
         stateless: bool = False,
+        page: Page | None = None,
     ) -> ChatResponse:
         """
         Send a message to Claude and wait for the complete response.
@@ -65,16 +66,18 @@ class ClaudeClient:
             file_paths: Optional list of local file paths to non-image files.
             model: Optional API model identifier. Browser selection is unchanged.
             stateless: Accepted for provider interface compatibility; ignored.
+            page: Page assigned to the request, or the client's default page.
 
         Returns ChatResponse with the assistant's reply and metadata.
         """
+        target_page = page if page is not None else self._page
         all_attachments = (image_paths or []) + (file_paths or [])
         log.info(f"Sending message ({len(text)} chars, {len(all_attachments)} attachments): {text[:80]}...")
         start_time = time.time()
 
         # 0. Count existing assistant messages so we know when a new one appears
-        pre_count = await count_assistant_messages(self._page)
-        pre_turn_signature = await get_latest_assistant_turn_signature(self._page)
+        pre_count = await count_assistant_messages(target_page)
+        pre_turn_signature = await get_latest_assistant_turn_signature(target_page)
         log.debug(f"Assistant messages before send: {pre_count}")
         log.debug(f"Latest assistant turn before send: {pre_turn_signature}")
 
@@ -83,31 +86,33 @@ class ClaudeClient:
 
         # 1.5. Upload files/images if provided
         if all_attachments:
-            await self._upload_files(all_attachments)
+            await self._upload_files(all_attachments, target_page)
 
         # 2. Find the chat input
-        input_selector = await self._find_selector(ClaudeSelectors.CHAT_INPUT, "chat input")
+        input_selector = await self._find_selector(
+            ClaudeSelectors.CHAT_INPUT, "chat input", target_page
+        )
         if not input_selector:
             raise RuntimeError("Could not find chat input element")
 
         # 3. Paste the message
-        await human_type(self._page, input_selector, text)
+        await human_type(target_page, input_selector, text)
 
         # Small pause after pasting
         await random_delay(150, 350)
 
         # 4. Send the message
-        sent = await self._click_send()
+        sent = await self._click_send(target_page)
         if not sent:
             # Fallback: try pressing Enter
             log.info("Send button not found, trying Enter key")
-            await self._page.keyboard.press("Enter")
+            await target_page.keyboard.press("Enter")
 
         # 5. Wait for response
         log.info("Waiting for Claude response...")
         expected_count = pre_count + 1
         completed = await wait_for_response_complete(
-            self._page,
+            target_page,
             expected_msg_count=expected_count,
             previous_turn_signature=pre_turn_signature,
         )
@@ -120,7 +125,7 @@ class ClaudeClient:
 
         # 6. Extract text content (Claude doesn't generate images like DALL-E)
         response_text = await extract_last_response_via_copy(
-            self._page,
+            target_page,
             previous_turn_signature=pre_turn_signature,
         )
 
@@ -130,12 +135,12 @@ class ClaudeClient:
             for attempt in range(1, 3):
                 await asyncio.sleep(4)
                 await wait_for_response_complete(
-                    self._page,
+                    target_page,
                     timeout_ms=90000,
                     previous_turn_signature=pre_turn_signature,
                 )
                 retry_text = await extract_last_response_via_copy(
-                    self._page,
+                    target_page,
                     previous_turn_signature=pre_turn_signature,
                 )
 
@@ -149,7 +154,7 @@ class ClaudeClient:
                 log.warning(f"Retry {attempt} still incomplete/transient")
 
         elapsed_ms = int((time.time() - start_time) * 1000)
-        thread_id = self._extract_thread_id()
+        thread_id = self._extract_thread_id(target_page)
 
         log.info(
             f"Response received ({elapsed_ms}ms, {len(response_text)} chars): "
@@ -230,11 +235,14 @@ class ClaudeClient:
 
     # ── Private Helpers ─────────────────────────────────────────
 
-    async def _find_selector(self, selectors: list[str], name: str) -> str | None:
+    async def _find_selector(
+        self, selectors: list[str], name: str, page: Page | None = None
+    ) -> str | None:
         """Try each selector in the fallback list. Return the first one that matches."""
+        target_page = page if page is not None else self._page
         for selector in selectors:
             try:
-                el = await self._page.wait_for_selector(
+                el = await target_page.wait_for_selector(
                     selector,
                     timeout=Config.SELECTOR_TIMEOUT,
                     state="visible",
@@ -249,19 +257,25 @@ class ClaudeClient:
         log.warning(f"No working selector found for: {name}")
         return None
 
-    async def _click_send(self) -> bool:
+    async def _click_send(self, page: Page | None = None) -> bool:
         """Try to click the send button using selector fallbacks."""
-        selector = await self._find_selector(ClaudeSelectors.SEND_BUTTON, "send button")
+        target_page = page if page is not None else self._page
+        selector = await self._find_selector(
+            ClaudeSelectors.SEND_BUTTON, "send button", target_page
+        )
         if selector:
-            await human_click(self._page, selector)
+            await human_click(target_page, selector)
             log.debug("Send button clicked")
             return True
         return False
 
-    async def _upload_files(self, file_paths: list[str]) -> None:
+    async def _upload_files(
+        self, file_paths: list[str], page: Page | None = None
+    ) -> None:
         """Upload files to Claude's input area."""
         from pathlib import Path
 
+        target_page = page if page is not None else self._page
         valid_paths = []
         for p in file_paths:
             path = Path(p)
@@ -280,7 +294,7 @@ class ClaudeClient:
         file_input = None
         for selector in ClaudeSelectors.FILE_UPLOAD_INPUT:
             try:
-                elements = await self._page.query_selector_all(selector)
+                elements = await target_page.query_selector_all(selector)
                 if elements:
                     file_input = elements[0]
                     log.debug(f"Found file input: {selector}")
@@ -294,7 +308,7 @@ class ClaudeClient:
         else:
             log.info("No file input found via selectors, trying broad input[type=file]")
             try:
-                await self._page.set_input_files("input[type='file']", valid_paths)
+                await target_page.set_input_files("input[type='file']", valid_paths)
                 log.info(f"Set {len(valid_paths)} file(s) via broad selector")
             except Exception as e:
                 log.error(f"Failed to upload files: {e}")
@@ -306,9 +320,10 @@ class ClaudeClient:
             await asyncio.sleep(len(valid_paths))
         log.info("File upload complete")
 
-    def _extract_thread_id(self) -> str:
-        """Extract the thread/conversation ID from the current URL."""
-        url = self._page.url
+    def _extract_thread_id(self, page: Page | None = None) -> str:
+        """Extract the thread/conversation ID from the requested page URL."""
+        target_page = page if page is not None else self._page
+        url = target_page.url
         # Claude uses /chat/{uuid}
         match = re.search(r"/chat/([a-f0-9-]+)", url)
         return match.group(1) if match else ""
